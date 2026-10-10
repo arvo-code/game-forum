@@ -20,9 +20,13 @@ def init_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
-            name TEXT
+            name TEXT,
+            reputation INTEGER NOT NULL DEFAULT 0
         )
     """)
+    user_cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "reputation" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN reputation INTEGER NOT NULL DEFAULT 0")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS topics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,11 +57,51 @@ def init_db():
 def save_user(tg_id, name):
     conn = db()
     conn.execute(
-        "INSERT OR IGNORE INTO users (tg_id, name) VALUES (?, ?)",
+        """
+        INSERT INTO users (tg_id, name, reputation)
+        VALUES (?, ?, 0)
+        ON CONFLICT(tg_id) DO UPDATE SET name = excluded.name
+        """,
         (tg_id, name),
     )
     conn.commit()
     conn.close()
+
+
+def user_reputation(tg_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT reputation FROM users WHERE tg_id = ?",
+        (tg_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def change_reputation(tg_id, delta):
+    if tg_id is None:
+        return
+    conn = db()
+    conn.execute(
+        "INSERT INTO users (tg_id, name, reputation) VALUES (?, ?, 0) ON CONFLICT(tg_id) DO NOTHING",
+        (tg_id, user_name(tg_id) if user_name(tg_id) != "неизвестный" else "Игрок"),
+    )
+    conn.execute(
+        "UPDATE users SET reputation = reputation + ? WHERE tg_id = ?",
+        (delta, tg_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def leaderboard(limit=10):
+    conn = db()
+    rows = conn.execute(
+        "SELECT tg_id, name, reputation FROM users ORDER BY reputation DESC, name ASC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 def add_topic(author_id, title, text):
     conn = db()
@@ -67,6 +111,7 @@ def add_topic(author_id, title, text):
     )
     conn.commit()
     conn.close()
+    change_reputation(author_id, 5)
 
 def all_topics():
     conn = db()
@@ -105,6 +150,7 @@ def add_post(topic_id, author_id, text):
     )
     conn.commit()
     conn.close()
+    change_reputation(author_id, 3)
 
 def add_report(reporter_id, reported_id, reason):
     conn = db()
@@ -146,13 +192,16 @@ def main_menu(chat_id):
     markup.add(
         types.InlineKeyboardButton("📋 Все темы", callback_data="topics"),
         types.InlineKeyboardButton("➕ Создать тему", callback_data="newtopic"),
+        types.InlineKeyboardButton("🏆 Рейтинг", callback_data="rating"),
+        types.InlineKeyboardButton("👤 Профиль", callback_data="profile"),
         types.InlineKeyboardButton("🚨 Пожаловаться", callback_data="reportuser"),
     )
     bot.send_message(
         chat_id,
         "Меню форума. Правила:\n"
         "- Обсуждаем только игры\n"
-        "- Без оскорблений",
+        "- Без оскорблений\n\n"
+        "За темы +5, за ответы +3 репутации.",
         reply_markup=markup,
     )
 
@@ -160,6 +209,27 @@ def main_menu(chat_id):
 def cmd_main(message):
     waiting.pop(message.chat.id, None)  # сбросить незавершённые действия
     main_menu(message.chat.id)
+
+@bot.message_handler(commands=["profile"])
+def cmd_profile(message):
+    tg_id = message.from_user.id
+    save_user(tg_id, message.from_user.first_name)
+    rep = user_reputation(tg_id)
+    bot.send_message(
+        message.chat.id,
+        f"👤 {user_name(tg_id)}\nРепутация: {rep} ⭐",
+    )
+
+@bot.message_handler(commands=["rating"])
+def cmd_rating(message):
+    rows = leaderboard(10)
+    if not rows:
+        bot.send_message(message.chat.id, "Пока никто не набрал репутацию.")
+        return
+    lines = ["🏆 Топ игроков:\n"]
+    for place, (uid, uname, rep) in enumerate(rows, start=1):
+        lines.append(f"{place}. {uname} — {rep} ⭐")
+    bot.send_message(message.chat.id, "\n".join(lines))
 
 @bot.message_handler(commands=["start"])
 def welcome(message):
@@ -237,6 +307,23 @@ def on_click(call):
         topic_id = int(data.split("_", 1)[1])
         bot.send_message(chat_id, f"Введи ответ для темы #{topic_id}:")
         waiting[chat_id] = ("reply", topic_id)
+
+    elif data == "profile":
+        save_user(tg_id, call.from_user.first_name)
+        bot.send_message(
+            chat_id,
+            f"👤 {user_name(tg_id)}\nРепутация: {user_reputation(tg_id)} ⭐",
+        )
+
+    elif data == "rating":
+        rows = leaderboard(10)
+        if not rows:
+            bot.send_message(chat_id, "Пока никто не набрал репутацию.")
+        else:
+            lines = ["🏆 Топ игроков:\n"]
+            for place, (uid, uname, rep) in enumerate(rows, start=1):
+                lines.append(f"{place}. {uname} — {rep} ⭐")
+            bot.send_message(chat_id, "\n".join(lines))
 
     elif data == "reportuser":
         users = all_users()
